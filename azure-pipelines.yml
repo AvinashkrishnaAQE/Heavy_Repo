@@ -1,0 +1,234 @@
+# Azure Pipeline for Playwright Tests with Microsoft Playwright Testing
+# This pipeline runs Playwright tests on Azure cloud browsers
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - README.md
+      - docs/**
+      - "*.md"
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  name: 'Azure Pipelines'
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - name: NODE_VERSION
+    value: '20.x'
+  - name: PLAYWRIGHT_SERVICE_URL
+    value: 'wss://eastasia.api.playwright.microsoft.com/playwrightworkspaces/4247ea18-110c-4652-b24a-5eef04f21c32/browsers'
+  - name: TEST_ENV
+    value: 'production'
+  # TEST_USER_EMAIL and TEST_USER_PASSWORD should be set as Secret variables in Azure DevOps
+
+stages:
+  - stage: Test
+    displayName: 'Run Playwright Tests'
+    jobs:
+      - job: PlaywrightTests
+        displayName: 'Execute Playwright Test Suite'
+        timeoutInMinutes: 60
+
+        steps:
+          # Install Node.js
+          - task: NodeTool@0
+            displayName: 'Install Node.js $(NODE_VERSION)'
+            inputs:
+              versionSpec: '$(NODE_VERSION)'
+
+          # Install dependencies
+          - script: npm ci
+            displayName: 'Install npm dependencies'
+            workingDirectory: $(Build.SourcesDirectory)
+
+          # Install Playwright browsers (for local fallback if Azure service fails)
+          - script: npx playwright install --with-deps
+            displayName: 'Install Playwright browsers (Chromium, Firefox, WebKit)'
+
+          # Debug: Check pipeline variables
+          - task: Bash@3
+            displayName: 'Debug - Verify pipeline variables'
+            env:
+              TEST_USER_EMAIL: $(TEST_USER_EMAIL)
+              TEST_USER_PASSWORD: $(TEST_USER_PASSWORD)
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Checking pipeline variables..."
+                echo "TEST_ENV from direct variable: $(TEST_ENV)"
+
+                # Check if variables are available in env block
+                if [ -z "$TEST_USER_EMAIL" ]; then
+                  echo "ERROR: TEST_USER_EMAIL is not set!"
+                  exit 1
+                elif [[ "$TEST_USER_EMAIL" == *'$('* ]]; then
+                  echo "ERROR: TEST_USER_EMAIL contains unexpanded Azure variable syntax: $TEST_USER_EMAIL"
+                  echo "This means the variable 'TEST_USER_EMAIL' is not defined in Azure DevOps Pipeline Variables."
+                  echo "Please add it in: Pipelines > Edit > Variables > New variable"
+                  exit 1
+                else
+                  echo "✓ TEST_USER_EMAIL is set (length: ${#TEST_USER_EMAIL})"
+                  echo "  Email format check: $TEST_USER_EMAIL" | grep -E '^[^\s@]+@[^\s@]+\.[^\s@]+$' && echo "  ✓ Valid email format" || echo "  ✗ Invalid email format"
+                fi
+
+                if [ -z "$TEST_USER_PASSWORD" ]; then
+                  echo "ERROR: TEST_USER_PASSWORD is not set!"
+                  exit 1
+                elif [[ "$TEST_USER_PASSWORD" == *'$('* ]]; then
+                  echo "ERROR: TEST_USER_PASSWORD contains unexpanded Azure variable syntax"
+                  echo "This means the variable 'TEST_USER_PASSWORD' is not defined in Azure DevOps Pipeline Variables."
+                  echo "Please add it in: Pipelines > Edit > Variables > New variable"
+                  exit 1
+                else
+                  echo "✓ TEST_USER_PASSWORD is set (length: ${#TEST_USER_PASSWORD})"
+                fi
+
+          # Create .env file with credentials
+          - task: Bash@3
+            displayName: 'Create .env file for tests'
+            env:
+              TEST_USER_EMAIL: $(TEST_USER_EMAIL)
+              TEST_USER_PASSWORD: $(TEST_USER_PASSWORD)
+              PLAYWRIGHT_SERVICE_ACCESS_TOKEN: $(PLAYWRIGHT_SERVICE_ACCESS_TOKEN)
+              TEST_ENV: $(TEST_ENV)
+              PLAYWRIGHT_SERVICE_URL: $(PLAYWRIGHT_SERVICE_URL)
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Creating .env file with credentials..."
+
+                # Validate environment variables
+                if [ -z "$TEST_USER_EMAIL" ] || [[ "$TEST_USER_EMAIL" == *'$('* ]]; then
+                  echo "❌ ERROR: TEST_USER_EMAIL is not properly set!"
+                  echo "Current value: $TEST_USER_EMAIL"
+                  echo ""
+                  echo "To fix this:"
+                  echo "1. Go to Azure DevOps > Pipelines > Your Pipeline"
+                  echo "2. Click 'Edit' > 'Variables' (top right)"
+                  echo "3. Click '+ New variable'"
+                  echo "4. Name: TEST_USER_EMAIL"
+                  echo "5. Value: your.email@example.com"
+                  echo "6. Check 'Keep this value secret' if needed"
+                  echo "7. Click OK and Save"
+                  exit 1
+                fi
+
+                if [ -z "$TEST_USER_PASSWORD" ] || [[ "$TEST_USER_PASSWORD" == *'$('* ]]; then
+                  echo "❌ ERROR: TEST_USER_PASSWORD is not properly set!"
+                  echo "Please add TEST_USER_PASSWORD variable in Azure DevOps Pipeline Variables"
+                  exit 1
+                fi
+
+                # Create .env file by writing each line
+                printf "TEST_ENV=%s\n" "$TEST_ENV" > .env
+                printf "TEST_USER_EMAIL=%s\n" "$TEST_USER_EMAIL" >> .env
+                printf "TEST_USER_PASSWORD=%s\n" "$TEST_USER_PASSWORD" >> .env
+                printf "PLAYWRIGHT_SERVICE_URL=%s\n" "$PLAYWRIGHT_SERVICE_URL" >> .env
+                printf "PLAYWRIGHT_SERVICE_ACCESS_TOKEN=%s\n" "$PLAYWRIGHT_SERVICE_ACCESS_TOKEN" >> .env
+                printf "BASE_URL=https://eventhub.rahulshettyacademy.com\n" >> .env
+                printf "API_BASE_URL=https://api.eventhub.rahulshettyacademy.com\n" >> .env
+                printf "RUN_PARALLEL=true\n" >> .env
+                printf "BROWSERS=chromium,firefox,webkit\n" >> .env
+
+                echo "✓ .env file created successfully"
+                echo ""
+                echo "Contents (with secrets masked):"
+                cat .env | sed 's/PASSWORD=.*/PASSWORD=***/' | sed 's/TOKEN=.*/TOKEN=***/'
+
+          # Run Playwright Tests with Azure Service
+          - task: Bash@3
+            displayName: 'Run Playwright Tests on Azure'
+            continueOnError: true
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Running Playwright tests with Microsoft Playwright Testing..."
+                echo "Test Environment: $(TEST_ENV)"
+
+                # .env file is already created in previous step
+                # Playwright will load it via dotenv in ConfigManager
+
+                # Run tests using service config
+                npx playwright test --config=playwright.service.config.ts --workers=10
+
+          # Publish test results (if using JUnit reporter)
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results'
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/test-results/**/*.xml'
+              mergeTestResults: true
+              failTaskOnFailedTests: true
+              testRunTitle: 'Playwright Tests - $(Build.BuildNumber)'
+
+          # Publish HTML report (only if exists)
+          - script: |
+              if [ -d "playwright-report" ]; then
+                echo "##vso[task.setvariable variable=REPORT_EXISTS]true"
+              fi
+            displayName: 'Check if HTML report exists'
+            condition: succeededOrFailed()
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Playwright HTML Report'
+            condition: and(succeededOrFailed(), eq(variables.REPORT_EXISTS, 'true'))
+            inputs:
+              targetPath: 'playwright-report'
+              artifact: 'playwright-report-$(System.JobAttempt)'
+              publishLocation: 'pipeline'
+
+          # Publish Allure results (only if exists)
+          - script: |
+              if [ -d "allure-results" ]; then
+                echo "##vso[task.setvariable variable=ALLURE_EXISTS]true"
+              fi
+            displayName: 'Check if Allure results exist'
+            condition: succeededOrFailed()
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Allure Results'
+            condition: and(succeededOrFailed(), eq(variables.ALLURE_EXISTS, 'true'))
+            inputs:
+              targetPath: 'allure-results'
+              artifact: 'allure-results-$(System.JobAttempt)'
+              publishLocation: 'pipeline'
+
+          # Publish test artifacts (screenshots, videos, traces) - only if exists
+          - script: |
+              if [ -d "test-results" ]; then
+                echo "##vso[task.setvariable variable=TEST_RESULTS_EXISTS]true"
+              fi
+            displayName: 'Check if test results exist'
+            condition: succeededOrFailed()
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Test Artifacts'
+            condition: and(succeededOrFailed(), eq(variables.TEST_RESULTS_EXISTS, 'true'))
+            inputs:
+              targetPath: 'test-results'
+              artifact: 'test-artifacts-$(System.JobAttempt)'
+              publishLocation: 'pipeline'
+
+          # Display summary
+          - script: |
+              echo "========================================="
+              echo "Test Execution Summary"
+              echo "========================================="
+              echo "Build Number: $(Build.BuildNumber)"
+              echo "Build ID: $(Build.BuildId)"
+              echo "Branch: $(Build.SourceBranchName)"
+              echo "Commit: $(Build.SourceVersion)"
+              echo "========================================="
+            displayName: 'Display Test Summary'
+            condition: always()
